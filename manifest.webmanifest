@@ -1,0 +1,16 @@
+{
+  "name": "截圖快編",
+  "short_name": "截圖快編",
+  "description": "貼上截圖、快速標註、複製帶走。全部在瀏覽器內處理，不上傳。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#16181d",
+  "theme_color": "#16181d",
+  "lang": "zh-Hant",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
