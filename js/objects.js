@@ -62,6 +62,17 @@ export function bbox(o) {
   return { x: 0, y: 0, w: 0, h: 0 };
 }
 
+/** bbox plus the ink that sticks out of it: stroke width, arrowheads, step rings. */
+export function visualBox(o) {
+  const b = bbox(o);
+  let m = 0;
+  if (o.type === 'arrow') m = Math.max(o.size * 5, 14) * 0.55 + o.size / 2;
+  else if (LINE_TYPES.has(o.type) || STROKE_TYPES.has(o.type)) m = o.size / 2;
+  else if ((o.type === 'rect' || o.type === 'ellipse') && !o.fill) m = o.size / 2;
+  else if (o.type === 'step') m = Math.max(1, o.size * 0.12) / 2;
+  return { x: b.x - m, y: b.y - m, w: b.w + m * 2, h: b.h + m * 2 };
+}
+
 export function boxHandles(b, cornersOnly = false) {
   const { x, y, w, h } = b;
   const corners = [
@@ -113,6 +124,19 @@ export function dragBox(b, id, px, py, keepAspect) {
     const h = b.h * s;
     return { x: px < ax ? ax - w : ax, y: py < ay ? ay - h : ay, w, h };
   }
+  if (keepAspect && b.w > 0 && b.h > 0) {
+    // Edge handle: scale from the opposite edge, staying centred on the other axis.
+    if (left || right) {
+      const ax = left ? b.x + b.w : b.x;
+      const w = Math.abs(px - ax);
+      const h = (b.h * w) / b.w;
+      return { x: px < ax ? ax - w : ax, y: b.y + (b.h - h) / 2, w, h };
+    }
+    const ay = top ? b.y + b.h : b.y;
+    const h = Math.abs(py - ay);
+    const w = (b.w * h) / b.h;
+    return { x: b.x + (b.w - w) / 2, y: py < ay ? ay - h : ay, w, h };
+  }
   let x0 = b.x, y0 = b.y, x1 = b.x + b.w, y1 = b.y + b.h;
   if (left) x0 = px;
   if (right) x1 = px;
@@ -143,9 +167,8 @@ export function resize(o, orig, handleId, px, py, shift) {
     }
     return;
   }
-  // Images keep their aspect ratio unless Shift is held; everything else is the reverse.
-  const keepAspect = o.type === 'image' ? !shift : shift;
-  const nb = dragBox(b, handleId, px, py, keepAspect);
+  // Shift keeps the aspect ratio, as in most editors.
+  const nb = dragBox(b, handleId, px, py, shift);
   if (STROKE_TYPES.has(o.type)) {
     const sx = b.w > 0 ? nb.w / b.w : 1;
     const sy = b.h > 0 ? nb.h / b.h : 1;
@@ -207,12 +230,14 @@ export function hitObject(o, x, y, tol) {
   return true;
 }
 
+/** The object's box in canvas pixels (the context may be translated), clipped to the canvas. */
 function clipRect(ctx, o) {
+  const t = ctx.getTransform();
   const b = normBox(o);
-  const x0 = Math.max(0, Math.floor(b.x));
-  const y0 = Math.max(0, Math.floor(b.y));
-  const x1 = Math.min(ctx.canvas.width, Math.ceil(b.x + b.w));
-  const y1 = Math.min(ctx.canvas.height, Math.ceil(b.y + b.h));
+  const x0 = Math.max(0, Math.floor(b.x + t.e));
+  const y0 = Math.max(0, Math.floor(b.y + t.f));
+  const x1 = Math.min(ctx.canvas.width, Math.ceil(b.x + b.w + t.e));
+  const y1 = Math.min(ctx.canvas.height, Math.ceil(b.y + b.h + t.f));
   return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
 }
 
@@ -220,6 +245,7 @@ function clipRect(ctx, o) {
 function drawPixelated(ctx, o, smooth) {
   const r = clipRect(ctx, o);
   if (!r) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   const block = Math.max(2, o.size);
   const tw = Math.max(1, Math.ceil(r.w / block));
   const th = Math.max(1, Math.ceil(r.h / block));
@@ -398,6 +424,7 @@ function drawObject(ctx, o) {
 
 function drawSpotlights(ctx, spots) {
   const { width, height } = ctx.canvas;
+  const t = ctx.getTransform();
   scratch.width = width;
   scratch.height = height;
   scratchCtx.fillStyle = 'rgba(0, 0, 0, .58)';
@@ -406,16 +433,27 @@ function drawSpotlights(ctx, spots) {
   scratchCtx.fillStyle = '#000';
   for (const s of spots) {
     const b = normBox(s);
-    scratchCtx.fillRect(b.x, b.y, b.w, b.h);
+    scratchCtx.fillRect(b.x + t.e, b.y + t.f, b.w, b.h);
   }
   scratchCtx.globalCompositeOperation = 'source-over';
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(scratch, 0, 0);
 }
 
-/** Paints the whole document. `skip` is an object hidden from view (the one being text-edited). */
-export function renderDoc(ctx, doc, extras = [], skip = null) {
+/**
+ * Paints the document into a canvas covering `frame` (document coordinates). Where the frame
+ * reaches past the image it is filled with `frame.bg`. `skip` is hidden (the text being edited).
+ */
+export function renderDoc(ctx, doc, extras = [], skip = null, frame = { x: 0, y: 0, w: doc.w, h: doc.h }) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, doc.w, doc.h);
+  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  const extends_ = frame.x < 0 || frame.y < 0 || frame.x + frame.w > doc.w || frame.y + frame.h > doc.h;
+  if (extends_ && frame.bg) {
+    ctx.fillStyle = frame.bg;
+    ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    ctx.clearRect(-frame.x, -frame.y, doc.w, doc.h);
+  }
+  ctx.setTransform(1, 0, 0, 1, -frame.x, -frame.y);
   ctx.drawImage(doc.base, 0, 0);
   const spots = [];
   for (const o of [...doc.objects, ...extras]) {

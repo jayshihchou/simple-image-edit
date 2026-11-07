@@ -1,6 +1,6 @@
 {
-  "name": "截圖快編",
-  "short_name": "截圖快編",
+  "name": "Simple Image Editor",
+  "short_name": "Simple Image Editor",
   "description": "貼上截圖、快速標註、複製帶走。全部在瀏覽器內處理，不上傳。",
   "start_url": "./",
   "scope": "./",

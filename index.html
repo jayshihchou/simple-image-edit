@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>截圖快編</title>
+<title>Simple Image Editor</title>
 <meta name="description" content="貼上截圖、快速標註、複製帶走。全部在瀏覽器內處理，不上傳。">
 <meta name="theme-color" content="#16181d">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -44,7 +44,7 @@
 </svg>
 
 <header class="topbar">
-  <div class="brand"><img src="icons/icon.svg" alt="" width="22" height="22"><span>截圖快編</span></div>
+  <div class="brand"><img src="icons/icon.svg" alt="" width="22" height="22"><span>Simple Image Editor</span></div>
 
   <div class="group">
     <button class="btn" id="btnOpen" data-tip="開啟檔案" data-key="Ctrl O"><svg><use href="#i-open"/></svg><span class="lbl">開啟</span></button>
@@ -83,6 +83,11 @@
     </div>
   </div>
 
+  <label class="switch" data-tip="每次編輯後自動複製到剪貼簿">
+    <input type="checkbox" id="autoCopy" role="switch">
+    <span class="track" aria-hidden="true"></span>
+    <span class="switch-label">自動複製</span>
+  </label>
   <button class="btn primary needs-doc" id="btnCopy" data-tip="複製編輯結果" data-key="Ctrl C"><svg id="copyIcon"><use href="#i-copy"/></svg><span id="copyLabel">複製</span></button>
 </header>
 
@@ -183,6 +188,25 @@
       <button type="button" class="btn" data-close>取消</button>
       <button class="btn accent" value="ok">套用</button>
     </div>
+  </form>
+</dialog>
+
+<dialog id="dlgPaste">
+  <form method="dialog">
+    <h2>貼上影像</h2>
+    <p class="muted" id="pasteNote">要開新圖，還是疊在目前的圖上？</p>
+    <canvas id="pastePreview" aria-hidden="true"></canvas>
+    <div class="choices">
+      <button class="choice" value="replace">
+        <span class="choice-title"><kbd>1</kbd>開新圖</span>
+        <span class="choice-desc">換掉目前的圖</span>
+      </button>
+      <button class="choice" value="overlay">
+        <span class="choice-title"><kbd>2</kbd>加入為圖層</span>
+        <span class="choice-desc">疊在目前的圖上，可移動縮放</span>
+      </button>
+    </div>
+    <div class="dlg-actions"><button type="button" class="btn" data-close>取消</button></div>
   </form>
 </dialog>
 

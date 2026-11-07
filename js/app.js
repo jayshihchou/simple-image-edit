@@ -1,6 +1,6 @@
 import {
   FONT, LINE_HEIGHT, bbox, boxHandles, clone, contrastColor, dragBox, handlesOf, hitObject,
-  normBox, renderDoc, resize, snapAngle, textMetrics, textPad, translate,
+  normBox, renderDoc, resize, snapAngle, textMetrics, textPad, translate, visualBox,
 } from './objects.js';
 
 const $ = (s) => document.querySelector(s);
@@ -15,13 +15,32 @@ const MOD = isMac ? '⌘' : 'Ctrl';
 const ACCENT = '#4c8dff';
 const MAX_HISTORY = 100;
 const MAX_CANVAS_SIDE = 16000;
+// Annotations reaching past the image grow the output to fit them, plus this margin (UI units).
+const MARGIN = 32;
+// Overhang smaller than this (UI units) is clipped as before, so a box hugging the edge
+// does not suddenly add a border.
+const OVERFLOW_TOL = 6;
+const AUTO_COPY_DELAY = 300;
+
+function loadPref(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v === '1';
+  } catch {
+    return fallback;
+  }
+}
+
+function savePref(key, value) {
+  try { localStorage.setItem(key, value ? '1' : '0'); } catch { /* storage unavailable */ }
+}
 
 const RED = '#ef4444';
 const PALETTE = [RED, '#f97316', '#facc15', '#22c55e', '#3b82f6', '#a855f7', '#111111', '#ffffff'];
 
 // `size` values here are UI units; objects store real pixels (UI value x doc.unit).
 const TOOLS = {
-  select: { label: '選取', key: 'V', icon: 'select', hint: '點選物件來移動、縮放或改樣式，雙擊文字可編輯' },
+  select: { label: '選取', key: 'V', icon: 'select', hint: '點選物件來移動、縮放或改樣式，Shift 拖曳控制點鎖定比例，雙擊文字可編輯' },
   crop: { label: '裁切', key: 'C', icon: 'crop', hint: '拖曳框選範圍，Enter 套用，Esc 取消' },
   sep1: null,
   arrow: { label: '箭頭', key: 'A', icon: 'arrow', color: RED, size: 4, sizeRange: [1, 30], sizeLabel: '粗細', hint: 'Shift 鎖定 45° 角' },
@@ -69,6 +88,8 @@ const S = {
   exportEntry: null,
   space: false,
   pinch: null,
+  autoCopy: loadPref('autoCopy', true),
+  bounds: null,
 };
 const pointers = new Map();
 
@@ -138,6 +159,12 @@ function commit() {
   invalidate();
 }
 
+/** Commit for an edit made with the left-hand tools; only these trigger auto copy. */
+function edited() {
+  commit();
+  scheduleAutoCopy();
+}
+
 function restore(entry) {
   closeEditor();
   const prev = S.doc;
@@ -195,28 +222,60 @@ function addOverlayImage(canvas) {
   commit();
 }
 
-/**
- * Auto rule: a pristine or already-exported document is finished, so a new image replaces it;
- * a document with unsaved edits gets the image as a movable layer. The toast offers the other.
- */
-function receiveImage(canvas, mode = 'auto') {
-  const hadDoc = !!S.doc;
-  const replace = !hadDoc || mode === 'replace' || (mode === 'auto' && isClean());
-  if (replace) setBase(canvas);
+function receiveImage(canvas, mode) {
+  if (!S.doc || mode === 'replace') setBase(canvas);
   else addOverlayImage(canvas);
-  if (hadDoc && mode === 'auto') {
-    toast(replace ? '已開啟新圖（可復原）' : '已加入為圖層', {
-      label: replace ? '改為疊加' : '改為取代',
-      action: () => { undo(); receiveImage(canvas, replace ? 'overlay' : 'replace'); },
-    });
-  }
 }
 
-async function receiveBlobs(blobs, mode = 'auto') {
+/**
+ * Asks whether a pasted image starts a new document or joins the current one.
+ * Resolves to 'replace', 'overlay', or '' when cancelled. The suggested choice is
+ * focused so Enter takes it: a new image when nothing is unsaved, else a layer.
+ */
+function askPasteMode(canvas) {
+  const dlg = $('#dlgPaste');
+  const pv = $('#pastePreview');
+  const s = Math.min(1, 360 / canvas.width, 160 / canvas.height);
+  pv.width = Math.max(1, Math.round(canvas.width * s));
+  pv.height = Math.max(1, Math.round(canvas.height * s));
+  pv.getContext('2d').drawImage(canvas, 0, 0, pv.width, pv.height);
+
+  const own = isOwnOutput(canvas);
+  const note = $('#pasteNote');
+  note.textContent = own ? '剪貼簿裡是目前的編輯結果，可能還沒截新圖。' : '要開新圖，還是疊在目前的圖上？';
+  note.classList.toggle('warn', own);
+
+  const suggested = isClean() ? 'replace' : 'overlay';
+  dlg.querySelectorAll('.choice').forEach((b) => b.classList.toggle('suggested', !own && b.value === suggested));
+  openDialog(dlg);
+  (own ? dlg.querySelector('[data-close]') : dlg.querySelector(`.choice[value="${suggested}"]`)).focus();
+  return new Promise((resolve) => {
+    dlg.addEventListener('close', () => resolve(dlg.returnValue), { once: true });
+  });
+}
+
+/** True if `c` is pixel-identical to what we last put on the clipboard (auto copy makes this common). */
+function isOwnOutput(c) {
+  if (!S.doc || S.history[S.hIndex] !== S.exportEntry) return false;
+  renderNow();
+  if (c.width !== mainCv.width || c.height !== mainCv.height) return false;
+  const a = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+  const b = mainCtx.getImageData(0, 0, c.width, c.height).data;
+  for (let i = 0; i < a.length; i += 4 * 61) {
+    for (let k = 0; k < 4; k++) if (Math.abs(a[i + k] - b[i + k]) > 2) return false;
+  }
+  return true;
+}
+
+async function receiveBlobs(blobs, mode = 'ask') {
   let first = true;
   for (const blob of blobs) {
     try {
       const c = await blobToCanvas(blob);
+      if (first && mode === 'ask' && S.doc) {
+        mode = await askPasteMode(c);
+        if (!mode) return;
+      }
       receiveImage(c, first ? mode : 'overlay');
       first = false;
     } catch (err) {
@@ -256,7 +315,9 @@ async function captureScreen() {
     await new Promise((r) => setTimeout(r, 300));
     const c = newCanvas(video.videoWidth, video.videoHeight);
     c.getContext('2d').drawImage(video, 0, 0);
-    receiveImage(c);
+    stream.getTracks().forEach((t) => t.stop());
+    const mode = S.doc ? await askPasteMode(c) : 'replace';
+    if (mode) receiveImage(c, mode);
   } catch (err) {
     if (err.name !== 'NotAllowedError') toast('無法擷取畫面', { error: true });
   } finally {
@@ -267,20 +328,60 @@ async function captureScreen() {
 /* ---------- view ---------- */
 
 function applyView() {
-  mainCv.style.transform = `translate(${S.panX}px, ${S.panY}px) scale(${S.zoom})`;
   mainCv.classList.toggle('pixelated', S.zoom >= 2);
   $('#zoomLabel').textContent = `${Math.round(S.zoom * 100)}%`;
   invalidate();
 }
 
+/**
+ * The output area in document coordinates: the image, grown to cover any annotation that
+ * reaches past it (plus a margin). The image always sits at (0, 0).
+ */
+function bounds() {
+  const { w, h, unit, objects } = S.doc;
+  const list = S.draft ? [...objects, S.draft] : objects;
+  const tol = OVERFLOW_TOL * unit;
+  const overflows = list.some((o) => {
+    const b = bbox(o);
+    return b.x < -tol || b.y < -tol || b.x + b.w > w + tol || b.y + b.h > h + tol;
+  });
+  if (!overflows) return { x: 0, y: 0, w, h };
+  let x0 = 0, y0 = 0, x1 = w, y1 = h;
+  for (const o of list) {
+    const v = visualBox(o);
+    x0 = Math.min(x0, v.x);
+    y0 = Math.min(y0, v.y);
+    x1 = Math.max(x1, v.x + v.w);
+    y1 = Math.max(y1, v.y + v.h);
+  }
+  const m = MARGIN * unit;
+  x0 = Math.floor(x0 - m);
+  y0 = Math.floor(y0 - m);
+  x1 = Math.min(Math.ceil(x1 + m), x0 + MAX_CANVAS_SIDE);
+  y1 = Math.min(Math.ceil(y1 + m), y0 + MAX_CANVAS_SIDE);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+// The area outside the image is painted with the stage colour, so the output looks like the editor.
+let stageColor = '';
+function stageBg() {
+  if (!stageColor) stageColor = getComputedStyle(stage).backgroundColor;
+  return stageColor;
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  stageColor = '';
+  invalidate();
+});
+
 function fit() {
   if (!S.doc) return;
+  const b = bounds();
   const m = 28;
   const sw = stage.clientWidth;
   const sh = stage.clientHeight;
-  S.zoom = Math.min((sw - m * 2) / S.doc.w, (sh - m * 2) / S.doc.h, 1) || 1;
-  S.panX = (sw - S.doc.w * S.zoom) / 2;
-  S.panY = (sh - S.doc.h * S.zoom) / 2;
+  S.zoom = Math.min((sw - m * 2) / b.w, (sh - m * 2) / b.h, 1) || 1;
+  S.panX = (sw - b.w * S.zoom) / 2 - b.x * S.zoom;
+  S.panY = (sh - b.h * S.zoom) / 2 - b.y * S.zoom;
   S.autoFit = true;
   applyView();
 }
@@ -320,11 +421,17 @@ function invalidate() {
 
 function renderNow() {
   if (S.doc) {
-    if (mainCv.width !== S.doc.w || mainCv.height !== S.doc.h) {
-      mainCv.width = S.doc.w;
-      mainCv.height = S.doc.h;
+    const b = bounds();
+    S.bounds = b;
+    if (mainCv.width !== b.w || mainCv.height !== b.h) {
+      mainCv.width = b.w;
+      mainCv.height = b.h;
+      $('#dims').textContent = `${b.w} × ${b.h}`;
     }
-    renderDoc(mainCtx, S.doc, S.draft ? [S.draft] : [], S.editing);
+    mainCv.style.transform = `translate(${S.panX + b.x * S.zoom}px, ${S.panY + b.y * S.zoom}px) scale(${S.zoom})`;
+    mainCv.dataset.x = b.x;
+    mainCv.dataset.y = b.y;
+    renderDoc(mainCtx, S.doc, S.draft ? [S.draft] : [], S.editing, { ...b, bg: stageBg() });
   }
   drawOverlay();
   positionEditor();
@@ -357,10 +464,11 @@ function drawOverlay() {
 
   if (S.tool === 'crop' && S.crop) {
     const b = S.crop;
+    const B = S.bounds;
     const x = sx(b.x), y = sy(b.y), w = b.w * S.zoom, h = b.h * S.zoom;
     c.fillStyle = 'rgba(0, 0, 0, .6)';
     c.beginPath();
-    c.rect(sx(0), sy(0), S.doc.w * S.zoom, S.doc.h * S.zoom);
+    c.rect(sx(B.x), sy(B.y), B.w * S.zoom, B.h * S.zoom);
     c.rect(x, y, w, h);
     c.fill('evenodd');
     c.strokeStyle = 'rgba(255, 255, 255, .35)';
@@ -425,7 +533,7 @@ function deleteSelected() {
   S.doc.objects.splice(S.doc.objects.indexOf(o), 1);
   if (o.type === 'step') renumberSteps();
   S.selected = null;
-  commit();
+  edited();
 }
 
 function duplicateSelected() {
@@ -437,7 +545,7 @@ function duplicateSelected() {
   if (d.type === 'step') d.n = nextStep();
   S.doc.objects.push(d);
   S.selected = d;
-  commit();
+  edited();
 }
 
 function reorderSelected(toFront) {
@@ -447,7 +555,7 @@ function reorderSelected(toFront) {
   list.splice(list.indexOf(o), 1);
   if (toFront) list.push(o);
   else list.unshift(o);
-  commit();
+  edited();
 }
 
 function newObject(tool, x, y) {
@@ -467,7 +575,7 @@ function finishDraft() {
   if (DRAW_BOX.has(o.type)) Object.assign(o, normBox(o));
   S.doc.objects.push(o);
   S.selected = o;
-  commit();
+  edited();
 }
 
 function updateDraft(pos, shift) {
@@ -543,9 +651,9 @@ function finishText() {
   if (!text) {
     S.doc.objects.splice(S.doc.objects.indexOf(o), 1);
     S.selected = null;
-    if (!wasNew) commit();
+    if (!wasNew) edited();
   } else if (changed || wasNew) {
-    commit();
+    edited();
   }
   syncOptions();
   invalidate();
@@ -570,20 +678,27 @@ editor.addEventListener('keydown', (e) => {
 
 /* ---------- crop ---------- */
 
+// Crop works on the whole output area, which may be larger than the image.
+function clampToBounds(x, y) {
+  const B = bounds();
+  return [Math.min(B.x + B.w, Math.max(B.x, x)), Math.min(B.y + B.h, Math.max(B.y, y))];
+}
+
 function clampCropMove(b) {
+  const B = bounds();
   return {
     ...b,
-    x: Math.min(Math.max(0, b.x), S.doc.w - b.w),
-    y: Math.min(Math.max(0, b.y), S.doc.h - b.h),
+    x: Math.min(Math.max(B.x, b.x), B.x + B.w - b.w),
+    y: Math.min(Math.max(B.y, b.y), B.y + B.h - b.h),
   };
 }
 
-function cropFromDrag(ax, ay, px, py) {
-  const aspect = S.cropAspect;
+function cropFromDrag(ax, ay, px, py, aspect = S.cropAspect) {
+  const B = bounds();
   let dx = px - ax;
   let dy = py - ay;
-  const maxX = dx >= 0 ? S.doc.w - ax : ax;
-  const maxY = dy >= 0 ? S.doc.h - ay : ay;
+  const maxX = dx >= 0 ? B.x + B.w - ax : ax - B.x;
+  const maxY = dy >= 0 ? B.y + B.h - ay : ay - B.y;
   if (aspect) {
     let w = Math.max(Math.abs(dx), Math.abs(dy) * aspect);
     w = Math.min(w, maxX, maxY * aspect);
@@ -619,19 +734,26 @@ function applyCrop() {
   const w = Math.round(c.w);
   const h = Math.round(c.h);
   if (w < 1 || h < 1) return false;
-  const base = newCanvas(w, h);
-  base.getContext('2d').drawImage(S.doc.base, -x, -y);
-  const objects = S.doc.objects.filter((o) => {
-    translate(o, clone(o), -x, -y);
-    const b = bbox(o);
-    return b.x < w && b.y < h && b.x + b.w > 0 && b.y + b.h > 0;
+  const tol = OVERFLOW_TOL * S.doc.unit;
+  const fits = (b) => b.x >= x - tol && b.y >= y - tol && b.x + b.w <= x + w + tol && b.y + b.h <= y + h + tol;
+  const misses = (b) => b.x >= x + w || b.y >= y + h || b.x + b.w <= x || b.y + b.h <= y;
+  // An annotation cut by the crop edge would grow the output again, so it is baked into the
+  // image, together with everything beneath it to keep the stacking order. The rest stay editable.
+  const all = S.doc.objects;
+  let cut = -1;
+  all.forEach((o, i) => {
+    if (!fits(bbox(o)) && !misses(visualBox(o))) cut = i;
   });
+  const base = newCanvas(w, h);
+  renderDoc(base.getContext('2d'), { ...S.doc, objects: all.slice(0, cut + 1) }, [], null, { x, y, w, h, bg: stageBg() });
+  const objects = all.slice(cut + 1).filter((o) => !misses(visualBox(o)));
+  objects.forEach((o) => translate(o, clone(o), -x, -y));
   S.doc = { ...S.doc, w, h, base, objects };
   S.crop = null;
   S.selected = null;
   S.tool = S.toolBeforeCrop;
   fit();
-  commit();
+  edited();
   return true;
 }
 
@@ -644,7 +766,7 @@ function cancelCrop() {
 
 function flattened() {
   renderNow();
-  const c = newCanvas(S.doc.w, S.doc.h);
+  const c = newCanvas(mainCv.width, mainCv.height);
   c.getContext('2d').drawImage(mainCv, 0, 0);
   return c;
 }
@@ -722,35 +844,65 @@ function finishPending() {
   }
 }
 
-function flashCopied() {
-  const btn = $('#btnCopy');
-  btn.classList.add('done');
-  $('#copyIcon use').setAttribute('href', '#i-check');
-  $('#copyLabel').textContent = '已複製';
-  clearTimeout(flashCopied.t);
-  flashCopied.t = setTimeout(() => {
-    btn.classList.remove('done');
-    $('#copyIcon use').setAttribute('href', '#i-copy');
-    $('#copyLabel').textContent = '複製';
-  }, 1600);
+/** The copy button reads "已複製" while the clipboard holds the current result. */
+function syncCopyState() {
+  const copied = !!S.doc && S.history[S.hIndex] === S.exportEntry;
+  $('#btnCopy').classList.toggle('done', copied);
+  $('#copyIcon use').setAttribute('href', copied ? '#i-check' : '#i-copy');
+  $('#copyLabel').textContent = copied ? '已複製' : '複製';
 }
 
-async function copyImage() {
+let autoCopyTimer = 0;
+let autoCopyWarned = false;
+
+function scheduleAutoCopy() {
+  clearTimeout(autoCopyTimer);
+  if (!S.autoCopy) return;
+  autoCopyTimer = setTimeout(() => {
+    const cur = S.history[S.hIndex];
+    // A freshly loaded image is already on the clipboard; mid-gesture states are not final.
+    if (!S.doc || S.drag || S.editing || cur === S.loadEntry || cur === S.exportEntry) return;
+    if (!document.hasFocus()) return;
+    copyImage(true);
+  }, AUTO_COPY_DELAY);
+}
+
+function setAutoCopy(on) {
+  S.autoCopy = on;
+  savePref('autoCopy', on);
+  $('#autoCopy').checked = on;
+  if (on) scheduleAutoCopy();
+}
+
+async function copyImage(auto = false) {
   if (!S.doc) return;
-  finishPending();
+  if (!auto) finishPending();
   renderNow();
   if (!navigator.clipboard?.write || !window.ClipboardItem) {
+    if (auto) return;
     toast('這個瀏覽器不支援複製影像，已改為下載');
     download('image/png');
     return;
   }
+  const entry = S.history[S.hIndex];
   try {
     // Safari only allows the write if the blob is passed as a promise inside the user gesture.
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': canvasToBlob(mainCv) })]);
-    S.exportEntry = S.history[S.hIndex];
-    flashCopied();
+    S.exportEntry = entry;
+    syncCopyState();
+    if (!auto) {
+      const btn = $('#btnCopy');
+      btn.classList.remove('pulse');
+      void btn.offsetWidth;
+      btn.classList.add('pulse');
+    }
   } catch (err) {
-    toast(`複製失敗：${err.message}`, { error: true });
+    if (!auto) {
+      toast(`複製失敗：${err.message}`, { error: true });
+    } else if (!autoCopyWarned) {
+      autoCopyWarned = true;
+      toast('瀏覽器擋下了自動複製，請手動按複製', { error: true });
+    }
   }
 }
 
@@ -766,7 +918,7 @@ async function download(type = 'image/png') {
   renderNow();
   let source = mainCv;
   if (type === 'image/jpeg') {
-    source = newCanvas(S.doc.w, S.doc.h);
+    source = newCanvas(mainCv.width, mainCv.height);
     const x = source.getContext('2d');
     x.fillStyle = '#ffffff';
     x.fillRect(0, 0, source.width, source.height);
@@ -848,8 +1000,7 @@ stage.addEventListener('pointerdown', (e) => {
     else if (c && pos.x >= c.x && pos.x <= c.x + c.w && pos.y >= c.y && pos.y <= c.y + c.h) {
       S.drag = { kind: 'crop-move', start: pos, orig: { ...c } };
     } else {
-      const ax = Math.min(S.doc.w, Math.max(0, pos.x));
-      const ay = Math.min(S.doc.h, Math.max(0, pos.y));
+      const [ax, ay] = clampToBounds(pos.x, pos.y);
       S.crop = null;
       S.drag = { kind: 'crop-new', ax, ay };
     }
@@ -942,12 +1093,13 @@ stage.addEventListener('pointermove', (e) => {
       invalidate();
       break;
     case 'crop-resize': {
-      const px = Math.min(S.doc.w, Math.max(0, pos.x));
-      const py = Math.min(S.doc.h, Math.max(0, pos.y));
-      if (S.cropAspect) {
+      const [px, py] = clampToBounds(pos.x, pos.y);
+      const corner = d.id.length === 2;
+      const aspect = S.cropAspect || (e.shiftKey && corner && d.orig.h > 0 ? d.orig.w / d.orig.h : 0);
+      if (aspect && corner) {
         const ax = d.id.includes('w') ? d.orig.x + d.orig.w : d.orig.x;
         const ay = d.id[0] === 'n' ? d.orig.y + d.orig.h : d.orig.y;
-        S.crop = cropFromDrag(ax, ay, px, py);
+        S.crop = cropFromDrag(ax, ay, px, py, aspect);
       } else {
         S.crop = dragBox(d.orig, d.id, px, py, false);
       }
@@ -987,7 +1139,7 @@ function endPointer(e) {
     }
     case 'move':
     case 'resize':
-      if (d.moved) commit();
+      if (d.moved) edited();
       break;
     case 'crop-new':
     case 'crop-resize':
@@ -1012,7 +1164,7 @@ function endPointer(e) {
       const o = { type: 'step', color: st.color, size: st.size * S.doc.unit, x: d.pos.x, y: d.pos.y, n: nextStep() };
       S.doc.objects.push(o);
       S.selected = o;
-      commit();
+      edited();
       break;
     }
   }
@@ -1062,15 +1214,24 @@ stage.addEventListener('wheel', (e) => {
   if (!S.doc) return;
   e.preventDefault();
   const r = stage.getBoundingClientRect();
-  if (e.ctrlKey || e.metaKey) {
-    zoomAt(S.zoom * Math.exp(-e.deltaY * 0.0025 * (e.deltaMode === 1 ? 16 : 1)), e.clientX - r.left, e.clientY - r.top);
+  // Wheel zooms. A sideways component means a trackpad two-finger swipe, which
+  // still pans; trackpad pinch arrives as ctrl+wheel and zooms.
+  const swipe = e.deltaX !== 0 && !e.ctrlKey && !e.metaKey;
+  if (!swipe) {
+    const dy = Math.max(-120, Math.min(120, e.deltaY * (e.deltaMode === 1 ? 16 : 1)));
+    zoomAt(S.zoom * Math.exp(-dy * 0.0025), e.clientX - r.left, e.clientY - r.top);
   } else {
-    S.panX -= e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX;
-    S.panY -= e.shiftKey && !e.deltaX ? 0 : e.deltaY;
+    S.panX -= e.deltaX;
+    S.panY -= e.deltaY;
     S.autoFit = false;
     applyView();
   }
 }, { passive: false });
+
+// Middle button pans (handled in pointerdown); stop the browser's autoscroll
+// and Linux's middle-click paste.
+stage.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+stage.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
 
 new ResizeObserver(() => {
   if (S.autoFit) fit();
@@ -1102,7 +1263,7 @@ function setStyle(key, value, shouldCommit = true) {
   if (styles[tool]) styles[tool][key] = value;
   if (obj) {
     obj[key] = key === 'size' ? value * S.doc.unit : value;
-    if (shouldCommit) commit();
+    if (shouldCommit) edited();
   }
   syncOptions();
   invalidate();
@@ -1164,7 +1325,7 @@ function syncUI() {
   $('#btnUndo').disabled = S.hIndex <= 0;
   $('#btnRedo').disabled = S.hIndex >= S.history.length - 1;
   $('#options').style.visibility = has ? '' : 'hidden';
-  if (has) $('#dims').textContent = `${S.doc.w} × ${S.doc.h}`;
+  syncCopyState();
   document.querySelectorAll('.tool').forEach((b) => {
     const on = b.dataset.tool === S.tool;
     b.classList.toggle('on', on);
@@ -1222,13 +1383,14 @@ function buildKeys() {
     ['刪除物件', 'Del'],
     ['微調位置', '方向鍵'],
     ['微調 10px', 'Shift 方向鍵'],
+    ['等比例縮放', 'Shift 拖曳控制點'],
     ['置頂／置底', `${MOD} ] [`],
     ['調整粗細', '[ ]'],
     ['放大／縮小', '+ −'],
     ['符合視窗', `${MOD} 0`],
     ['100%', `${MOD} 1`],
-    ['平移畫面', '空白鍵拖曳'],
-    ['縮放畫面', `${MOD} 滾輪`],
+    ['平移畫面', '中鍵拖曳或空白鍵拖曳'],
+    ['縮放畫面', '滾輪'],
     ['取消／完成', 'Esc'],
   ];
   $('#keysTable').innerHTML = rows.map(([a, b]) => `<div><span>${a}</span><kbd>${b}</kbd></div>`).join('');
@@ -1273,13 +1435,14 @@ function openDialog(dlg) {
 
 function openResize() {
   finishPending();
-  const { w, h } = S.doc;
+  renderNow();
+  const { width: w, height: h } = mainCv;
   const W = $('#rzW');
   const H = $('#rzH');
   W.value = w;
   H.value = h;
-  W.oninput = () => { if ($('#rzLock').checked) H.value = Math.max(1, Math.round((W.value * S.doc.h) / S.doc.w)); };
-  H.oninput = () => { if ($('#rzLock').checked) W.value = Math.max(1, Math.round((H.value * S.doc.w) / S.doc.h)); };
+  W.oninput = () => { if ($('#rzLock').checked) H.value = Math.max(1, Math.round((W.value * h) / w)); };
+  H.oninput = () => { if ($('#rzLock').checked) W.value = Math.max(1, Math.round((H.value * w) / h)); };
   openDialog($('#dlgResize'));
 }
 
@@ -1287,11 +1450,17 @@ function setupDialogs() {
   document.querySelectorAll('[data-close]').forEach((b) => {
     b.onclick = () => b.closest('dialog').close();
   });
+  $('#dlgPaste').addEventListener('keydown', (e) => {
+    const value = { 1: 'replace', 2: 'overlay' }[e.key];
+    if (!value || e.ctrlKey || e.metaKey || e.altKey) return;
+    e.preventDefault();
+    $('#dlgPaste').close(value);
+  });
   document.querySelectorAll('#rzPresets button').forEach((b) => {
     b.onclick = () => {
       const pct = Number(b.dataset.pct) / 100;
-      $('#rzW').value = Math.max(1, Math.round(S.doc.w * pct));
-      $('#rzH').value = Math.max(1, Math.round(S.doc.h * pct));
+      $('#rzW').value = Math.max(1, Math.round(mainCv.width * pct));
+      $('#rzH').value = Math.max(1, Math.round(mainCv.height * pct));
     };
   });
   $('#dlgResize').addEventListener('close', () => {
@@ -1564,7 +1733,13 @@ function init() {
   $('#emptyCapture').onclick = captureScreen;
   $('#btnUndo').onclick = undo;
   $('#btnRedo').onclick = redo;
-  $('#btnCopy').onclick = copyImage;
+  $('#btnCopy').onclick = () => copyImage();
+  $('#autoCopy').checked = S.autoCopy;
+  $('#autoCopy').addEventListener('change', (e) => {
+    setAutoCopy(e.target.checked);
+    toast(e.target.checked ? '自動複製已開啟：每次編輯後自動複製' : '自動複製已關閉');
+    e.target.blur();
+  });
   $('#btnDownload').title = '';
   $('#btnHelp').onclick = () => openDialog($('#dlgHelp'));
   $('#zoomOut').onclick = () => zoomCenter(0.8);
