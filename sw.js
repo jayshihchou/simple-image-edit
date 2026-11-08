@@ -1,5 +1,7 @@
 // Network-first so a new deploy shows up immediately; the cache only serves offline launches.
-const CACHE = 'screenshot-editor-v1';
+// Every request revalidates with the server: the browser's HTTP cache (10 min on GitHub Pages)
+// could otherwise pair a fresh index.html with a stale app.js and break startup.
+const CACHE = 'screenshot-editor-v2';
 const ASSETS = [
   './',
   'index.html',
@@ -13,7 +15,11 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(
+    caches.open(CACHE)
+      .then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' }))))
+      .then(() => self.skipWaiting()),
+  );
 });
 
 self.addEventListener('activate', (e) => {
@@ -25,16 +31,19 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
+  const req = e.request;
+  if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  // Navigation requests cannot be re-created with options, and are revalidated anyway.
+  const fresh = req.mode === 'navigate' ? fetch(req) : fetch(req, { cache: 'no-cache' });
   e.respondWith(
-    fetch(e.request)
+    fresh
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(e.request, copy));
+          caches.open(CACHE).then((c) => c.put(req, copy));
         }
         return res;
       })
-      .catch(() => caches.match(e.request)),
+      .catch(() => caches.match(req)),
   );
 });
