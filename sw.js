@@ -1,13 +1,14 @@
 // Network-first so a new deploy shows up immediately; the cache only serves offline launches.
-// Every request revalidates with the server: the browser's HTTP cache (10 min on GitHub Pages)
-// could otherwise pair a fresh index.html with a stale app.js and break startup.
-const CACHE = 'screenshot-editor-v2';
+// The deploy workflow replaces __V__ with the commit, so every deploy is a new worker with its
+// own cache, and index.html asks for exactly the style.css / app.js / objects.js it was built
+// with. A fresh page can then never run with a stale script left in some cache.
+const V = '__V__';
+const CACHE = `simple-image-editor-${V}`;
 const ASSETS = [
   './',
-  'index.html',
-  'style.css',
-  'js/app.js',
-  'js/objects.js',
+  `style.css?v=${V}`,
+  `js/app.js?v=${V}`,
+  `js/objects.js?v=${V}`,
   'manifest.webmanifest',
   'icons/icon.svg',
   'icons/icon-192.png',
@@ -44,6 +45,6 @@ self.addEventListener('fetch', (e) => {
         }
         return res;
       })
-      .catch(() => caches.match(req)),
+      .catch(() => caches.match(req, { ignoreSearch: req.mode === 'navigate' })),
   );
 });

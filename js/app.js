@@ -1,7 +1,7 @@
 import {
   FONT, LINE_HEIGHT, bbox, boxHandles, clone, contrastColor, dragBox, handlesOf, hitObject,
   normBox, renderDoc, resize, snapAngle, textMetrics, textPad, translate, visualBox,
-} from './objects.js';
+} from './objects.js?v=__V__';
 
 const $ = (s) => document.querySelector(s);
 const stage = $('#stage');

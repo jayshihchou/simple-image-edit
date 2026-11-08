@@ -47,4 +47,6 @@ python3 -m http.server 8000
 
 ## 部署
 
-推送到 `main` 後由 GitHub Pages 發布：repo 的 **Settings → Pages → Deploy from a branch**，選 `main` 分支和 `/ (root)`。
+推送到 `main` 後由 GitHub Actions（`.github/workflows/pages.yml`）發布到 GitHub Pages。部署時會把 `__V__` 換成 commit 版本號，讓 `index.html` 一定載入同一版的 `style.css` 和 `js/app.js`，避免瀏覽器快取混用新舊檔案。本機開發不需要替換。
+
+repo 的 **Settings → Pages → Source** 要設為 **GitHub Actions**。
