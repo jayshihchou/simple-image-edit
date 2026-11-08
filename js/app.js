@@ -145,8 +145,12 @@ function toast(msg, { action, label, error = false, ms = 3000 } = {}) {
 
 /* ---------- history ---------- */
 
+// Objects carry a stable id so undo/redo can keep the same object selected.
+let nextId = 1;
+
 function snapshot() {
   const { w, h, base, unit, objects } = S.doc;
+  for (const o of objects) o.id ??= nextId++;
   return { w, h, base, unit, objects: objects.map(clone) };
 }
 
@@ -168,8 +172,9 @@ function edited() {
 function restore(entry) {
   closeEditor();
   const prev = S.doc;
+  const selectedId = S.selected?.id;
   S.doc = { ...entry, objects: entry.objects.map(clone) };
-  S.selected = null;
+  S.selected = (selectedId && S.doc.objects.find((o) => o.id === selectedId)) || null;
   S.draft = null;
   S.crop = null;
   if (S.tool === 'crop') S.tool = S.toolBeforeCrop;
@@ -518,6 +523,7 @@ function duplicateSelected() {
   const o = S.selected;
   if (!o) return;
   const d = clone(o);
+  delete d.id;
   const off = 16 * S.doc.unit;
   translate(d, clone(o), off, off);
   if (d.type === 'step') d.n = nextStep();
@@ -890,7 +896,7 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-async function download(type = 'image/png') {
+async function download(type = 'image/png', name = `screenshot-${stamp()}`) {
   if (!S.doc) return;
   finishPending();
   renderNow();
@@ -908,13 +914,54 @@ async function download(type = 'image/png') {
     if (blob.type !== type) toast(`這個瀏覽器不支援 ${type}，已存成 ${ext.toUpperCase()}`);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `screenshot-${stamp()}.${ext}`;
+    a.download = `${name}.${ext}`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     S.exportEntry = S.history[S.hIndex];
   } catch (err) {
     toast(`下載失敗：${err.message}`, { error: true });
   }
+}
+
+const DOWNLOAD_TYPES = { '': 'image/png', 1: 'image/png', true: 'image/png', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+
+/**
+ * Loads an image named in the address: ?url=<image>&download=png|jpg|webp&name=<file name>.
+ * The same keys work after # instead of ?, which keeps the image address out of server logs.
+ * The image host must allow cross-site reads (CORS), or the browser will not hand over the pixels.
+ */
+async function loadFromAddress() {
+  const params = new URLSearchParams(location.search);
+  for (const [k, v] of new URLSearchParams(location.hash.slice(1))) params.set(k, v);
+  const src = params.get('url');
+  if (!src) return;
+
+  toast('正在從網址載入圖片…', { ms: 30000 });
+  let canvas;
+  try {
+    const res = await fetch(new URL(src, location.href), { mode: 'cors', credentials: 'omit' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    canvas = await blobToCanvas(await res.blob());
+  } catch (err) {
+    const why = err.message === 'too large' ? `影像超過 ${MAX_CANVAS_SIDE}px 上限`
+      : err instanceof TypeError ? '對方網站不允許跨站讀取（CORS），或網址無法連線'
+      : err.message.startsWith('HTTP') ? `伺服器回應 ${err.message}`
+      : '網址的內容不是可讀取的圖片';
+    toast(`無法從網址載入圖片：${why}`, { error: true, ms: 10000 });
+    return;
+  }
+  $('#toast').hidden = true;
+  receiveImage(canvas, 'replace');
+
+  const fmt = params.get('download');
+  if (fmt === null) return;
+  const type = DOWNLOAD_TYPES[fmt.toLowerCase()];
+  if (!type) {
+    toast(`不支援的下載格式「${fmt}」，可用 png、jpg、webp`, { error: true });
+    return;
+  }
+  const name = (params.get('name') || '').replace(/[\\/:*?"<>|]+/g, '_').replace(/\.(png|jpe?g|webp)$/i, '');
+  await download(type, name || undefined);
 }
 
 /* ---------- pointer interaction ---------- */
@@ -1747,6 +1794,7 @@ function init() {
 
   syncUI();
   invalidate();
+  loadFromAddress();
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
     navigator.serviceWorker.register('sw.js').catch(() => {});

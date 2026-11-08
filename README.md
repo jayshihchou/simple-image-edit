@@ -16,6 +16,26 @@
 
 已經有圖時再貼上（或拖曳檔案），會詢問要**開新圖**還是**加入為圖層**，按 `1` / `2` 或 `Enter` 選建議項。兩種都可以復原。
 
+## 從網址載入
+
+在網址後面加參數，開啟頁面時就會載入那張圖：
+
+```
+https://jayshihchou.github.io/simple-image-edit/?url=<圖片網址>
+https://jayshihchou.github.io/simple-image-edit/?url=<圖片網址>&download=png
+https://jayshihchou.github.io/simple-image-edit/?url=<圖片網址>&download=jpg&name=報告
+```
+
+| 參數 | 說明 |
+| --- | --- |
+| `url` | 圖片網址，含 `&`、`?` 時請先做 URL 編碼 |
+| `download` | 載入後直接下載，可填 `png`（預設）、`jpg`、`webp` |
+| `name` | 下載的檔名，不填就用時間戳記 |
+
+參數也可以放在 `#` 後面（例如 `#url=...`），這樣圖片網址不會送到伺服器。
+
+> 圖片所在的網站必須允許跨站讀取（CORS），例如 `raw.githubusercontent.com`、多數圖床與 CDN。不允許的網站會顯示錯誤，這是瀏覽器的安全限制。
+
 ## 工具
 
 | 工具 | 快捷鍵 | 說明 |
