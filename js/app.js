@@ -303,28 +303,6 @@ async function pasteFromButton() {
   }
 }
 
-async function captureScreen() {
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    video.muted = true;
-    await video.play();
-    // Let the share-picker UI disappear and a real frame arrive.
-    await new Promise((r) => setTimeout(r, 300));
-    const c = newCanvas(video.videoWidth, video.videoHeight);
-    c.getContext('2d').drawImage(video, 0, 0);
-    stream.getTracks().forEach((t) => t.stop());
-    const mode = S.doc ? await askPasteMode(c) : 'replace';
-    if (mode) receiveImage(c, mode);
-  } catch (err) {
-    if (err.name !== 'NotAllowedError') toast('無法擷取畫面', { error: true });
-  } finally {
-    stream?.getTracks().forEach((t) => t.stop());
-  }
-}
-
 /* ---------- view ---------- */
 
 function applyView() {
@@ -1720,17 +1698,11 @@ function init() {
     $('#pasteKey').textContent = '⌘ V';
     $('#copyKey').textContent = '⌘ C';
   }
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    $('#btnCapture').hidden = true;
-    $('#emptyCapture').hidden = true;
-  }
 
   $('#btnOpen').onclick = pick;
   $('#emptyOpen').onclick = pick;
   $('#btnPaste').onclick = pasteFromButton;
   $('#emptyPaste').onclick = pasteFromButton;
-  $('#btnCapture').onclick = captureScreen;
-  $('#emptyCapture').onclick = captureScreen;
   $('#btnUndo').onclick = undo;
   $('#btnRedo').onclick = redo;
   $('#btnCopy').onclick = () => copyImage();

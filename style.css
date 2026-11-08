@@ -473,7 +473,7 @@ input[type=color]#frColor { width: 44px; height: 28px; padding: 0; border: 1px s
   .switch-label, .btn .chev { display: none; }
 }
 @media (max-width: 720px) {
-  .brand, .lbl, .btn .chev, #btnCapture, #btnHelp, .switch-label { display: none; }
+  .brand, .lbl, .btn .chev, #btnHelp, .switch-label { display: none; }
   .switch { padding: 0 3px; }
   .topbar { gap: 3px; padding-inline: 6px; }
   .topbar > .group:first-of-type { border-left: 0; padding-left: 0; }
