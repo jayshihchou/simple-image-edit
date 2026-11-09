@@ -40,7 +40,7 @@ const PALETTE = [RED, '#f97316', '#facc15', '#22c55e', '#3b82f6', '#a855f7', '#1
 
 // `size` values here are UI units; objects store real pixels (UI value x doc.unit).
 const TOOLS = {
-  select: { label: '選取', key: 'V', icon: 'select', hint: '點選物件來移動、縮放或改樣式，Shift 拖曳控制點鎖定比例，雙擊文字可編輯' },
+  select: { label: '選取', key: 'V', icon: 'select', hint: '點選物件來移動、縮放或改樣式，Shift 點選或拖曳框選可選多個，雙擊文字可編輯' },
   crop: { label: '裁切', key: 'C', icon: 'crop', hint: '拖曳框選範圍，Enter 套用，Esc 取消' },
   sep1: null,
   arrow: { label: '箭頭', key: 'A', icon: 'arrow', color: RED, size: 4, sizeRange: [1, 30], sizeLabel: '粗細', hint: 'Shift 鎖定 45° 角' },
@@ -71,7 +71,13 @@ const S = {
   doc: null,
   tool: 'arrow',
   toolBeforeCrop: 'arrow',
-  selected: null,
+  // Assigning `selected` always ends a multi-selection, so the two can never disagree.
+  pick: null,
+  get selected() { return this.pick; },
+  set selected(o) { this.pick = o; this.multi = []; },
+  multi: [],
+  marquee: null,
+  objClip: null,
   draft: null,
   drag: null,
   crop: null,
@@ -173,9 +179,9 @@ function edited() {
 function restore(entry) {
   closeEditor();
   const prev = S.doc;
-  const selectedId = S.selected?.id;
+  const ids = selection().map((o) => o.id);
   S.doc = { ...entry, objects: entry.objects.map(clone) };
-  S.selected = (selectedId && S.doc.objects.find((o) => o.id === selectedId)) || null;
+  setSelection(S.doc.objects.filter((o) => ids.includes(o.id)));
   S.draft = null;
   S.crop = null;
   if (S.tool === 'crop') S.tool = S.toolBeforeCrop;
@@ -209,6 +215,7 @@ function setBase(canvas) {
     objects: [],
   };
   S.selected = null;
+  S.objClip = null;
   S.crop = null;
   if (S.tool === 'crop') S.tool = S.toolBeforeCrop;
   fit();
@@ -495,9 +502,44 @@ function drawOverlay() {
     }
     for (const hd of handlesOf(o)) drawHandle(c, sx(hd.x), sy(hd.y));
   }
+
+  if (S.multi.length) {
+    c.strokeStyle = ACCENT;
+    c.lineWidth = 1.5;
+    c.setLineDash([5, 4]);
+    for (const m of S.multi) {
+      const b = bbox(m);
+      c.strokeRect(sx(b.x), sy(b.y), b.w * S.zoom, b.h * S.zoom);
+    }
+    c.setLineDash([]);
+  }
+
+  if (S.marquee) {
+    const { x, y, w, h } = S.marquee;
+    c.fillStyle = ACCENT;
+    c.globalAlpha = 0.15;
+    c.fillRect(sx(x), sy(y), w * S.zoom, h * S.zoom);
+    c.globalAlpha = 1;
+    c.strokeStyle = ACCENT;
+    c.lineWidth = 1;
+    c.strokeRect(sx(x), sy(y), w * S.zoom, h * S.zoom);
+  }
 }
 
 /* ---------- objects ---------- */
+
+function selection() {
+  return S.multi.length ? S.multi : S.selected ? [S.selected] : [];
+}
+
+function setSelection(list) {
+  S.selected = list.length === 1 ? list[0] : null;
+  if (list.length > 1) S.multi = list;
+}
+
+function inDocOrder(list) {
+  return S.doc.objects.filter((o) => list.includes(o));
+}
 
 // Drawing tools always draw something new; moving and resizing belongs to the select tool,
 // which holding Ctrl / ⌘ borrows temporarily.
@@ -529,35 +571,79 @@ function renumberSteps() {
 }
 
 function deleteSelected() {
-  const o = S.selected;
-  if (!o) return;
-  S.doc.objects.splice(S.doc.objects.indexOf(o), 1);
-  if (o.type === 'step') renumberSteps();
+  const list = selection();
+  if (!list.length) return;
+  S.doc.objects = S.doc.objects.filter((o) => !list.includes(o));
+  if (list.some((o) => o.type === 'step')) renumberSteps();
   S.selected = null;
   edited();
 }
 
-function duplicateSelected() {
-  const o = S.selected;
-  if (!o) return;
-  const d = clone(o);
-  delete d.id;
-  const off = 16 * S.doc.unit;
-  translate(d, clone(o), off, off);
-  if (d.type === 'step') d.n = nextStep();
-  S.doc.objects.push(d);
-  S.selected = d;
+function addCopies(list, offset) {
+  setSelection(list.map((o) => {
+    const d = clone(o);
+    delete d.id;
+    translate(d, clone(o), offset, offset);
+    if (d.type === 'step') d.n = nextStep();
+    S.doc.objects.push(d);
+    return d;
+  }));
   edited();
 }
 
+function duplicateSelected() {
+  if (selection().length) addCopies(inDocOrder(selection()), 16 * S.doc.unit);
+}
+
 function reorderSelected(toFront) {
-  const o = S.selected;
-  if (!o) return;
-  const list = S.doc.objects;
-  list.splice(list.indexOf(o), 1);
-  if (toFront) list.push(o);
-  else list.unshift(o);
+  const picked = inDocOrder(selection());
+  if (!picked.length) return;
+  const rest = S.doc.objects.filter((o) => !picked.includes(o));
+  S.doc.objects = toFront ? [...rest, ...picked] : [...picked, ...rest];
   edited();
+}
+
+/*
+ * Ctrl C on selected objects remembers them here and also puts the finished image on the system
+ * clipboard, so pasting into another app still gives the result. Ctrl V then needs to tell the
+ * two apart: if the clipboard still holds an image this page wrote, paste the objects; anything
+ * else was copied since (a new screenshot) and is pasted as an image, as always.
+ */
+function copyObjects() {
+  const items = inDocOrder(selection()).map(clone);
+  S.objClip = { items, pastes: 0 };
+  toast(`已複製 ${items.length} 個物件，按 ${MOD} V 貼上`);
+}
+
+function pasteObjects() {
+  const clip = S.objClip;
+  clip.pastes++;
+  addCopies(clip.items, 16 * S.doc.unit * clip.pastes);
+}
+
+const OWN_COPIES_KEPT = 8;
+const ownCopies = [];
+
+/** Partly transparent pixels are skipped: they do not survive a clipboard round trip exactly. */
+function pixelPrint(cv) {
+  const { data } = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height);
+  let hash = 2166136261;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] !== 255) continue;
+    for (let c = 0; c < 3; c++) hash = Math.imul(hash ^ data[i + c], 16777619);
+  }
+  return `${cv.width}x${cv.height}:${hash >>> 0}`;
+}
+
+async function isOwnCopy(blob) {
+  try {
+    const bmp = await createImageBitmap(blob);
+    const cv = newCanvas(bmp.width, bmp.height);
+    cv.getContext('2d').drawImage(bmp, 0, 0);
+    return ownCopies.includes(pixelPrint(cv));
+  } catch {
+    return false;
+  }
 }
 
 function newObject(tool, x, y) {
@@ -887,10 +973,13 @@ async function copyImage(auto = false) {
     return;
   }
   const entry = S.history[S.hIndex];
+  const print = pixelPrint(mainCv);
   try {
     // Safari only allows the write if the blob is passed as a promise inside the user gesture.
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': canvasToBlob(mainCv) })]);
     S.exportEntry = entry;
+    ownCopies.push(print);
+    if (ownCopies.length > OWN_COPIES_KEPT) ownCopies.shift();
     syncCopyState();
     if (!auto) {
       const btn = $('#btnCopy');
@@ -1014,6 +1103,10 @@ function updatePinch() {
   zoomAt(S.pinch.zoom * (Math.hypot(a.x - b.x, a.y - b.y) / S.pinch.dist), cx - r.left, cy - r.top);
 }
 
+function moveDrag(start, list, hit) {
+  return { kind: 'move', start, hit, items: list.map((obj) => ({ obj, orig: clone(obj) })), moved: false };
+}
+
 stage.addEventListener('pointerdown', (e) => {
   if (e.target === editor || e.target.closest('.statusbar, .empty')) return;
   if (!S.doc) return;
@@ -1058,16 +1151,24 @@ stage.addEventListener('pointerdown', (e) => {
       S.drag = { kind: 'resize', id: handle.id, obj: sel, orig: clone(sel), moved: false };
       return;
     }
-    if (hitObject(sel, pos.x, pos.y, tol)) {
-      S.drag = { kind: 'move', start: pos, obj: sel, orig: clone(sel), moved: false };
+    if (!e.shiftKey && hitObject(sel, pos.x, pos.y, tol)) {
+      S.drag = moveDrag(pos, [sel], sel);
       return;
     }
   }
 
   if (editing) {
     const hit = hitTop(pos.x, pos.y, tol);
-    S.selected = hit;
-    if (hit) S.drag = { kind: 'move', start: pos, obj: hit, orig: clone(hit), moved: false };
+    if (hit && e.shiftKey) {
+      const list = selection();
+      setSelection(list.includes(hit) ? list.filter((o) => o !== hit) : [...list, hit]);
+    } else if (hit) {
+      if (!S.multi.includes(hit)) S.selected = hit;
+      S.drag = moveDrag(pos, selection(), hit);
+    } else {
+      S.drag = { kind: 'marquee', start: pos, base: e.shiftKey ? selection() : [] };
+      S.selected = null;
+    }
     syncOptions();
     invalidate();
     return;
@@ -1120,9 +1221,13 @@ stage.addEventListener('pointermove', (e) => {
     case 'move':
       if (d.moved || Math.hypot(pos.x - d.start.x, pos.y - d.start.y) * S.zoom > 2) {
         d.moved = true;
-        translate(d.obj, d.orig, pos.x - d.start.x, pos.y - d.start.y);
+        for (const { obj, orig } of d.items) translate(obj, orig, pos.x - d.start.x, pos.y - d.start.y);
         invalidate();
       }
+      break;
+    case 'marquee':
+      S.marquee = normBox({ x: d.start.x, y: d.start.y, w: pos.x - d.start.x, h: pos.y - d.start.y });
+      invalidate();
       break;
     case 'resize':
       d.moved = true;
@@ -1168,7 +1273,9 @@ function endPointer(e) {
   if (!d) return;
   if (e.type === 'pointercancel') {
     S.draft = null;
+    S.marquee = null;
     if (d.orig && d.obj) Object.assign(d.obj, clone(d.orig));
+    d.items?.forEach(({ obj, orig }) => Object.assign(obj, clone(orig)));
     invalidate();
     return;
   }
@@ -1184,9 +1291,22 @@ function endPointer(e) {
       break;
     }
     case 'move':
+      if (d.moved) edited();
+      else if (S.multi.length) S.selected = d.hit; // a plain click narrows the group to one
+      break;
     case 'resize':
       if (d.moved) edited();
       break;
+    case 'marquee': {
+      const m = S.marquee;
+      S.marquee = null;
+      const hits = !m ? [] : S.doc.objects.filter((o) => {
+        const b = bbox(o);
+        return b.x < m.x + m.w && b.x + b.w > m.x && b.y < m.y + m.h && b.y + b.h > m.y;
+      });
+      setSelection([...new Set([...d.base, ...hits])]);
+      break;
+    }
     case 'crop-new':
     case 'crop-resize':
     case 'crop-move':
@@ -1358,7 +1478,7 @@ function syncOptions() {
     $('#cropSize').textContent = c ? `${Math.round(c.w)} × ${Math.round(c.h)}` : '';
     $('#cropApply').disabled = !c;
   }
-  const hasObj = !!S.selected && !S.editing;
+  const hasObj = selection().length > 0 && !S.editing;
   $('#optObject').hidden = !hasObj;
   $('#hint').textContent = (hasObj && S.tool !== 'select') ? `按住 ${MOD} 拖曳可移動或縮放` : (TOOLS[S.tool]?.hint || '');
 }
@@ -1426,6 +1546,9 @@ function buildKeys() {
     ['開啟檔案', `${MOD} O`],
     ['復原', `${MOD} Z`],
     ['重做', `${MOD} Y`],
+    ['複製／貼上物件', `${MOD} C / ${MOD} V`],
+    ['加選物件', 'Shift 點選'],
+    ['框選多個物件', '選取工具在空白處拖曳'],
     ['再製物件', `${MOD} D`],
     ['刪除物件', 'Del'],
     ['微調位置', '方向鍵'],
@@ -1583,6 +1706,8 @@ document.addEventListener('keydown', (e) => {
       case 'c':
         if (has && !getSelection().toString()) {
           e.preventDefault();
+          if (selection().length) copyObjects();
+          else S.objClip = null;
           copyImage();
         }
         return;
@@ -1634,12 +1759,12 @@ document.addEventListener('keydown', (e) => {
 
   const sel = S.selected;
   if (e.key.startsWith('Arrow') && t.type !== 'range') {
-    if (!sel) return;
+    if (!selection().length) return;
     e.preventDefault();
     const d = e.shiftKey ? 10 : 1;
     const dx = e.key === 'ArrowLeft' ? -d : e.key === 'ArrowRight' ? d : 0;
     const dy = e.key === 'ArrowUp' ? -d : e.key === 'ArrowDown' ? d : 0;
-    translate(sel, clone(sel), dx, dy);
+    for (const o of selection()) translate(o, clone(o), dx, dy);
     clearTimeout(nudgeTimer);
     nudgeTimer = setTimeout(commit, 400);
     invalidate();
@@ -1654,7 +1779,7 @@ document.addEventListener('keydown', (e) => {
       return;
     case 'Escape':
       if (S.tool === 'crop') cancelCrop();
-      else if (sel) { S.selected = null; syncOptions(); invalidate(); }
+      else if (selection().length) { S.selected = null; syncOptions(); invalidate(); }
       else setTool('select');
       return;
     case 'Enter':
@@ -1716,7 +1841,19 @@ document.addEventListener('paste', (e) => {
       if (f) blobs.push(f);
     }
   }
-  if (blobs.length) {
+  if (S.objClip && !S.editing && !document.querySelector('dialog[open]')) {
+    e.preventDefault();
+    finishPending();
+    // No image at all means nothing newer to prefer over the copied objects.
+    (blobs.length ? isOwnCopy(blobs[0]) : Promise.resolve(true)).then((own) => {
+      if (own) {
+        pasteObjects();
+      } else {
+        S.objClip = null;
+        receiveBlobs(blobs);
+      }
+    });
+  } else if (blobs.length) {
     e.preventDefault();
     if (document.querySelector('dialog[open]')) return;
     finishPending();
@@ -1788,7 +1925,7 @@ function init() {
   $('#emptyPaste').onclick = pasteFromButton;
   $('#btnUndo').onclick = undo;
   $('#btnRedo').onclick = redo;
-  $('#btnCopy').onclick = () => copyImage();
+  $('#btnCopy').onclick = () => { S.objClip = null; copyImage(); };
   $('#autoCopy').checked = S.autoCopy;
   $('#autoCopy').addEventListener('change', (e) => {
     setAutoCopy(e.target.checked);
