@@ -87,6 +87,7 @@ const S = {
   loadEntry: null,
   exportEntry: null,
   space: false,
+  mod: false,
   pinch: null,
   autoCopy: loadPref('autoCopy', true),
   bounds: null,
@@ -471,7 +472,18 @@ function drawOverlay() {
   }
 
   const o = S.selected;
-  if (o && o !== S.editing) {
+  if (o && o !== S.editing && !editsSelection()) {
+    // Drawing tools leave the last shape selected so style changes still apply to it, but it
+    // is not grabbable here, so only outline it faintly.
+    const b = bbox(o);
+    c.strokeStyle = ACCENT;
+    c.globalAlpha = 0.6;
+    c.lineWidth = 1;
+    c.setLineDash([4, 4]);
+    c.strokeRect(sx(b.x), sy(b.y), b.w * S.zoom, b.h * S.zoom);
+    c.setLineDash([]);
+    c.globalAlpha = 1;
+  } else if (o && o !== S.editing) {
     const lineLike = o.type === 'arrow' || o.type === 'line';
     if (!lineLike) {
       const b = bbox(o);
@@ -486,6 +498,12 @@ function drawOverlay() {
 }
 
 /* ---------- objects ---------- */
+
+// Drawing tools always draw something new; moving and resizing belongs to the select tool,
+// which holding Ctrl / ⌘ borrows temporarily.
+function editsSelection(e) {
+  return S.tool === 'select' || (e ? e.ctrlKey || e.metaKey : S.mod);
+}
 
 function hitTop(x, y, tol) {
   const list = S.doc.objects;
@@ -1032,8 +1050,9 @@ stage.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  const editing = editsSelection(e);
   const sel = S.selected;
-  if (sel) {
+  if (sel && editing) {
     const handle = hitHandle(handlesOf(sel), pos.x, pos.y, tol);
     if (handle) {
       S.drag = { kind: 'resize', id: handle.id, obj: sel, orig: clone(sel), moved: false };
@@ -1045,7 +1064,7 @@ stage.addEventListener('pointerdown', (e) => {
     }
   }
 
-  if (S.tool === 'select') {
+  if (editing) {
     const hit = hitTop(pos.x, pos.y, tol);
     S.selected = hit;
     if (hit) S.drag = { kind: 'move', start: pos, obj: hit, orig: clone(hit), moved: false };
@@ -1076,6 +1095,8 @@ stage.addEventListener('pointermove', (e) => {
     return;
   }
   if (!S.doc) return;
+  lastHover = e;
+  setMod(e.ctrlKey || e.metaKey);
   const d = S.drag;
   if (!d) {
     updateCursor(e);
@@ -1219,18 +1240,19 @@ function updateCursor(e) {
   const pos = toDoc(e);
   const tol = touchTol(e);
   const CURSORS = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize', p1: 'grab', p2: 'grab' };
-  let cursor = S.tool === 'select' ? 'default' : S.tool === 'text' ? 'text' : 'crosshair';
+  const editing = editsSelection(e);
+  let cursor = editing ? 'default' : S.tool === 'text' ? 'text' : 'crosshair';
   if (S.tool === 'crop') {
     const c = S.crop;
     const h = c && hitHandle(boxHandles(c, !!S.cropAspect), pos.x, pos.y, tol);
     if (h) cursor = CURSORS[h.id];
     else if (c && pos.x >= c.x && pos.x <= c.x + c.w && pos.y >= c.y && pos.y <= c.y + c.h) cursor = 'move';
   } else {
-    const sel = S.selected;
+    const sel = editing && S.selected;
     const h = sel && hitHandle(handlesOf(sel), pos.x, pos.y, tol);
     if (h) cursor = CURSORS[h.id];
     else if (sel && hitObject(sel, pos.x, pos.y, tol)) cursor = 'move';
-    else if (S.tool === 'select' && hitTop(pos.x, pos.y, tol)) cursor = 'move';
+    else if (editing && hitTop(pos.x, pos.y, tol)) cursor = 'move';
   }
   stage.style.cursor = cursor;
 }
@@ -1338,7 +1360,7 @@ function syncOptions() {
   }
   const hasObj = !!S.selected && !S.editing;
   $('#optObject').hidden = !hasObj;
-  $('#hint').textContent = (hasObj && S.tool !== 'select') ? '' : (TOOLS[S.tool]?.hint || '');
+  $('#hint').textContent = (hasObj && S.tool !== 'select') ? `按住 ${MOD} 拖曳可移動或縮放` : (TOOLS[S.tool]?.hint || '');
 }
 
 function syncUI() {
@@ -1409,6 +1431,7 @@ function buildKeys() {
     ['微調位置', '方向鍵'],
     ['微調 10px', 'Shift 方向鍵'],
     ['等比例縮放', 'Shift 拖曳控制點'],
+    ['繪圖時調整物件', `按住 ${MOD} 拖曳`],
     ['置頂／置底', `${MOD} ] [`],
     ['調整粗細', '[ ]'],
     ['放大／縮小', '+ −'],
@@ -1662,6 +1685,19 @@ document.addEventListener('keydown', (e) => {
 });
 
 let nudgeTimer = 0;
+
+// Ctrl / ⌘ held = select tool for the moment; show handles and the right cursor right away.
+let lastHover = null;
+function setMod(on) {
+  if (S.mod === on) return;
+  S.mod = on;
+  if (!S.doc) return;
+  if (lastHover && !S.drag && lastHover.target?.isConnected) updateCursor(lastHover);
+  invalidate();
+}
+window.addEventListener('keydown', (e) => { if (e.key === 'Control' || e.key === 'Meta') setMod(true); }, true);
+window.addEventListener('keyup', (e) => { if (e.key === 'Control' || e.key === 'Meta') setMod(false); }, true);
+window.addEventListener('blur', () => setMod(false));
 
 document.addEventListener('keyup', (e) => {
   if (e.code === 'Space') {
